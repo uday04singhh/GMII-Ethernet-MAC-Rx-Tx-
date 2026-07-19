@@ -1,82 +1,46 @@
 `timescale 1ns / 1ps
-// =============================================================================
 //  GMII_MAC_Top.sv
-//
-//  Top-level wrapper that wires GMII_Rx_MAC → handshake bridge →
-//  GMII_Tx_MAC.  The bridge converts the Rx AXI-Stream master port
-//  (no back-pressure) into a FIFO-backed AXI-Stream slave that the Tx
-//  MAC can consume with proper tready / tvalid handshaking.
-//
-//  Block diagram
-//  ─────────────
-//   GMII PHY RX ──► GMII_Rx_MAC ──► [rx_axis] ──► RX FIFO (async)
-//                                                       │
-//   External AXI-S ─────────────────────────────────── │ (mux, see NOTE)
-//   (s_axis_*)                                          ▼
-//                                              GMII_Tx_MAC ──► GMII PHY TX
-//
-//  NOTE: The mux lets you choose at synthesis / run-time whether the Tx
-//  MAC is fed from the loopback FIFO (rx path) or from an external AXI-S
-//  source (e.g. a packet-generator in a test-bench or PCIe DMA).
-//  Set the `loopback_en` input to 1 for Rx→Tx loopback, 0 for external.
-//
-//  Handshake signals exposed at the top level
-//  ───────────────────────────────────────────
-//   rx_frame_done   – pulses 1 cycle when Rx finishes a frame (CRC ok/err)
-//   rx_crc_ok       – level: 1 when last completed frame had good CRC
-//   tx_frame_done   – pulses 1 cycle when Tx finishes a frame
-//   fifo_overflow   – sticky flag: Rx produced data faster than Tx consumed
-// =============================================================================
+//  Top-level wrapper that wires GMII_Rx_MAC 
 
 module GMII_MAC_Top #(
-    parameter FIFO_DEPTH = 2048          // must be a power of two
+    parameter FIFO_DEPTH = 2048          
 )(
-    // ── Clocks & reset ──────────────────────────────────────────────────────
     input  wire        rx_clk,
     input  wire        tx_clk,
-    input  wire        rst,              // synchronous, active-high (for both domains)
+    input  wire        rst,             
 
-    // ── GMII RX (from PHY) ──────────────────────────────────────────────────
+    //GMII RX (from PHY)
     input  wire [7:0]  gmii_rxd,
     input  wire        gmii_rx_dv,
     input  wire        gmii_rx_er,
 
-    // ── GMII TX (to PHY) ────────────────────────────────────────────────────
+    //GMII TX (to PHY)
     output wire [7:0]  gmii_txd,
     output wire        gmii_tx_en,
     output wire        gmii_tx_er,
 
-    // ── External AXI-Stream source (packet generator / DMA) ─────────────────
-    //    Used when loopback_en == 0
     input  wire [7:0]  s_axis_tdata,
     input  wire        s_axis_tvalid,
     input  wire        s_axis_tlast,
     output wire        s_axis_tready,
 
-    // ── Control ─────────────────────────────────────────────────────────────
-    input  wire        loopback_en,      // 1 = Rx→Tx loopback, 0 = external src
+    input  wire        loopback_en,      
 
-    // ── Status / handshake outputs ──────────────────────────────────────────
     output wire        rx_frame_done,
     output wire        rx_crc_ok,
     output wire        tx_frame_done,
     output wire        fifo_overflow,
 
-    // ── Debug: loopback FIFO occupancy (in TX clock domain) ─────────────────
     output wire [$clog2(FIFO_DEPTH):0] fifo_level
 );
 
-// ============================================================================
-//  Internal AXI-Stream wires from Rx MAC
-// ============================================================================
+
 wire [7:0]  rx_m_tdata;
 wire        rx_m_tvalid;
 wire        rx_m_tlast;
 wire        rx_m_tuser;   // set when frame is truncated/errored
 
-// ============================================================================
-//  Rx MAC instantiation
-// ============================================================================
+
 GMII_Rx_MAC u_rx_mac (
     .rx_clk        (rx_clk),
     .rst           (rst),
@@ -91,28 +55,15 @@ GMII_Rx_MAC u_rx_mac (
     .frame_done    (rx_frame_done)
 );
 
-// ============================================================================
-//  Async FIFO  (CDC: rx_clk write → tx_clk read)
-//
-//  The Rx MAC has no tready port, so we must never stall it.
-//  The FIFO absorbs the burst and the Tx MAC drains it.
-//
-//  For real use replace this with your vendor FIFO primitive
-//  (Xilinx xpm_fifo_async, Intel DCFIFO, etc.).  The interface
-//  used here matches xpm_fifo_async for easy drop-in.
-// ============================================================================
 
-// Write side (rx_clk domain)
 wire        fifo_wr_en   = rx_m_tvalid;
-wire [8:0]  fifo_din     = {rx_m_tlast, rx_m_tdata};  // pack tlast as MSB
+wire [8:0]  fifo_din     = {rx_m_tlast, rx_m_tdata};  
 wire        fifo_full;
 
-// Read side (tx_clk domain)
 wire        fifo_rd_en;
 wire [8:0]  fifo_dout;
 wire        fifo_empty;
 
-// Overflow: write attempted when FIFO full
 reg         fifo_overflow_r;
 assign fifo_overflow = fifo_overflow_r;
 
@@ -120,7 +71,7 @@ always @(posedge rx_clk) begin
     if (rst)
         fifo_overflow_r <= 1'b0;
     else if (fifo_wr_en && fifo_full)
-        fifo_overflow_r <= 1'b1;   // sticky
+        fifo_overflow_r <= 1'b1;   
 end
 
 // ──────────────────────────────────────────────────────────────────────────
