@@ -1,7 +1,28 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
 // Create Date: 05.08.2026 17:33:53
+// Design Name: 
 // Module Name: GMII_rx
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Revision 0.02 - PAYLOAD state now accumulates bytes into a shift register
+//                 and emits ONE wide word (fifo_wr_data/fifo_wr_en) instead of
+//                 streaming byte-by-byte on m_axis_tdata. This word is meant to
+//                 be written into an async FIFO to cross into the faster
+//                 "core clock" domain in a single CDC crossing, instead of one
+//                 crossing per byte.
+// Additional Comments:
+// 
 //////////////////////////////////////////////////////////////////////////////////
 
 module GMII_Rx_MAC (
@@ -16,7 +37,19 @@ module GMII_Rx_MAC (
     output reg         m_axis_tlast,
     output reg         m_axis_tuser,
     output reg         crc_ok,
-    output reg         frame_done
+    output reg         frame_done,
+
+    // ---- ADDED ----
+    // These two ports are new. Instead of forwarding the payload one byte at a
+    // time (which is what m_axis_tdata/m_axis_tvalid were doing before), the
+    // PAYLOAD state now builds up the full payload inside an internal shift
+    // register and exposes it here as ONE parallel word, valid for exactly one
+    // rx_clk cycle. This is the word you write into your async FIFO. Doing the
+    // CDC crossing once per packet (here) instead of once per byte (the old
+    // m_axis_tvalid pulses) is the whole point, per our earlier discussion.
+    output reg  [31:0] fifo_wr_data,   // sized to PAYLOAD_BYTES*8 bits, see localparam below
+    output reg         fifo_wr_en      // single-cycle pulse: "fifo_wr_data is valid, latch it"
+    // ---- END ADDED ----
 );
 
 function [31:0] crc32_byte;
@@ -51,6 +84,14 @@ localparam [15:0] FPGA_PORT = 16'h1388;
 
 localparam [1:0] PAYLOAD_LEN = 2'd3;   
 
+// ---- ADDED ----
+// Number of bytes actually captured in the PAYLOAD state = PAYLOAD_LEN + 1
+// (payload_byte_cnt runs 0,1,2,3 -> 4 byte-arrivals before CHECK is entered).
+// This sizes the shift register / fifo_wr_data bus width automatically, so if
+// PAYLOAD_LEN ever changes, the shift register width tracks it.
+localparam integer PAYLOAD_BYTES = PAYLOAD_LEN + 1;   // = 4 bytes = 32 bits
+// ---- END ADDED ----
+
 logic [31:0] crc_reg;
 
 logic [7:0]  rx_buf [0:3];
@@ -68,6 +109,15 @@ logic [1:0]  payload_byte_cnt;
 logic sfd_detected; //adding a register between the idle and header state
 
 logic [47:0] mac_buf;   // 48-bit shift buffer for incoming destination MAC bytes
+
+// ---- ADDED ----
+// This is the actual shift register that accumulates the payload bytes as
+// they arrive, one per rx_clk cycle, MSB-first. Once the last payload byte
+// has been shifted in, its full contents are latched out onto fifo_wr_data
+// in the same cycle fifo_wr_en pulses. Width matches PAYLOAD_BYTES*8 so this
+// stays consistent if PAYLOAD_LEN is changed later.
+logic [(PAYLOAD_BYTES*8)-1:0] payload_shift_reg;
+// ---- END ADDED ----
 
 
 //SEQEUNTIAL BLOCK
@@ -156,6 +206,14 @@ always @(posedge rx_clk) begin
         itch_len       <= 16'h0000;
         mac_buf        <= 48'h0;
         sfd_detected   <= 1'b0;
+
+        // ---- ADDED ----
+        // Reset the new shift register and FIFO write-pulse signals along
+        // with everything else, so they don't come up in an unknown state.
+        payload_shift_reg <= {(PAYLOAD_BYTES*8){1'b0}};
+        fifo_wr_data       <= 32'h0;
+        fifo_wr_en         <= 1'b0;
+        // ---- END ADDED ----
     end   
     
     else begin
@@ -163,6 +221,13 @@ always @(posedge rx_clk) begin
         m_axis_tlast  <= 1'b0;
         m_axis_tuser  <= 1'b0;
         frame_done    <= 1'b0;
+
+        // ---- ADDED ----
+        // fifo_wr_en must default low every cycle so it only pulses for
+        // exactly one rx_clk cycle when the payload word is complete
+        // (mirrors how m_axis_tvalid/tlast are defaulted low above).
+        fifo_wr_en <= 1'b0;
+        // ---- END ADDED ----
         
         case (state)
  
@@ -178,6 +243,14 @@ always @(posedge rx_clk) begin
                 etype_hi      <= 8'h00;
                 itch_len      <= 16'h0000;
                 payload_byte_cnt <= 2'd0;
+
+                // ---- ADDED ----
+                // Clear the shift register whenever we re-enter IDLE (i.e. at
+                // the start of every new frame), so a partially-built word
+                // from a previous, possibly-aborted frame can never leak into
+                // the next frame's payload.
+                payload_shift_reg <= {(PAYLOAD_BYTES*8){1'b0}};
+                // ---- END ADDED ----
  
                 sfd_detected <= (gmii_rx_dv && gmii_rxd == 8'hD5);
  
@@ -246,18 +319,48 @@ always @(posedge rx_clk) begin
             PAYLOAD: begin
                 if (gmii_rx_dv) begin
                     crc_reg <= crc32_byte(crc_reg, gmii_rxd);
-                
-                    // forward the payload byte straight to the AXI-Stream side
-                    m_axis_tdata  <= gmii_rxd;
-                    m_axis_tvalid <= 1'b1;
+
+                    // ---- CHANGED ----
+                    // OLD behaviour (removed): every incoming payload byte was
+                    // forwarded immediately via m_axis_tdata/m_axis_tvalid,
+                    // i.e. one AXI-Stream "transaction" per byte:
+                    //
+                    //   m_axis_tdata  <= gmii_rxd;
+                    //   m_axis_tvalid <= 1'b1;
+                    //
+                    // NEW behaviour: shift each incoming byte into
+                    // payload_shift_reg instead. This builds up the complete
+                    // payload internally, byte by byte, using the SAME
+                    // rx_clk domain the MAC already runs in -- no extra
+                    // latency added here, this is "free" (overlapped with
+                    // reception), exactly like the byte-position-counter
+                    // parser we discussed.
+                    payload_shift_reg <= {payload_shift_reg[(PAYLOAD_BYTES*8)-9:0], gmii_rxd};
+                    // ---- END CHANGED ----
                 
                     itch_byte_cnt <= itch_byte_cnt + 16'd1;
                     byte_cnt      <= byte_cnt + 10'd1;
                 
                     payload_byte_cnt <= payload_byte_cnt + 2'd1;
                     
-                    if (payload_byte_cnt == PAYLOAD_LEN)
-                        m_axis_tlast <= 1'b1;
+                    if (payload_byte_cnt == PAYLOAD_LEN) begin
+                        // ---- CHANGED ----
+                        // OLD: m_axis_tlast <= 1'b1;  (marked last byte of the
+                        // byte-by-byte AXI stream)
+                        //
+                        // NEW: on this same "last byte" cycle, the shift
+                        // register above is still one cycle away from
+                        // containing this final byte (non-blocking assignment
+                        // hasn't landed yet), so we fold the incoming byte in
+                        // directly here to build the final, complete word,
+                        // and pulse fifo_wr_en for exactly one cycle so the
+                        // async FIFO on the far side latches ONE full word
+                        // -- a single CDC crossing per packet instead of one
+                        // crossing per byte.
+                        fifo_wr_data <= payload_shift_reg;
+                        fifo_wr_en   <= 1'b1;
+                        // ---- END CHANGED ----
+                    end
                     end
                 end
             
@@ -279,11 +382,3 @@ always @(posedge rx_clk) begin
 end
                                      
 endmodule
-
-
-
-
-
-
-
-
